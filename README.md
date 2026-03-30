@@ -125,6 +125,16 @@ cd backend/mail
 npm run dev
 ```
 
+
+### Start the Next.js Frontend
+```bash
+# Terminal 4: Frontend
+cd frontend
+npm run dev
+```
+
+Your Next.js frontend will now be accessible at `http://localhost:3000`, communicating with your fully operational backend microservices!
+
 ### Start Chat Service
 ```bash
 cd backend/chat
