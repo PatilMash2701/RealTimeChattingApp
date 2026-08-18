@@ -5,12 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.startSendOtpConsumer = void 0;
 const amqplib_1 = __importDefault(require("amqplib"));
-const dotenv_1 = __importDefault(require("dotenv"));
 const nodemailer_1 = __importDefault(require("nodemailer"));
-const path_1 = __importDefault(require("path"));
-dotenv_1.default.config({ path: path_1.default.resolve(process.cwd(), '../mail/.env') });
-console.log('USER:', process.env.USER);
-console.log('PASSWORD:', process.env.PASSWORD ? 'loaded' : 'undefined');
 const startSendOtpConsumer = async () => {
     try {
         const connection = await amqplib_1.default.connect({
@@ -28,12 +23,20 @@ const startSendOtpConsumer = async () => {
             if (msg) {
                 try {
                     const { to, subject, body } = JSON.parse(msg.content.toString());
+                    const smtpUser = process.env.SMTP_USER || process.env.MAIL_USER;
+                    const smtpPass = process.env.SMTP_PASSWORD || process.env.MAIL_PASSWORD;
+                    if (!smtpUser || !smtpPass) {
+                        console.error("SMTP credentials missing (set SMTP_USER and SMTP_PASSWORD)");
+                        channel.nack(msg, false, false);
+                        return;
+                    }
                     const transporter = nodemailer_1.default.createTransport({
-                        host: "smtp.gmail.com",
-                        port: 465,
+                        host: process.env.SMTP_HOST || "smtp.gmail.com",
+                        port: Number(process.env.SMTP_PORT) || 465,
+                        secure: process.env.SMTP_SECURE !== "false",
                         auth: {
-                            user: process.env.USER,
-                            pass: process.env.PASSWORD
+                            user: smtpUser,
+                            pass: smtpPass,
                         },
                     });
                     await transporter.sendMail({

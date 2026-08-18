@@ -1,0 +1,143 @@
+# Local / staging: full stack with MongoDB, Redis, RabbitMQ
+# Usage: cp .env.example .env  →  fill secrets  →  docker compose up --build
+
+name: pulse
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-pulse}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-pulse}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+
+  user:
+    build:
+      context: ./backend/user
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379
+      Rabbitmq_Host: rabbitmq
+      Rabbitmq_Username: ${RABBITMQ_USER:-pulse}
+      Rabbitmq_Password: ${RABBITMQ_PASSWORD:-pulse}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  mail:
+    build:
+      context: ./backend/mail
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 5001
+      Rabbitmq_Host: rabbitmq
+      Rabbitmq_Username: ${RABBITMQ_USER:-pulse}
+      Rabbitmq_Password: ${RABBITMQ_PASSWORD:-pulse}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  chat:
+    build:
+      context: ./backend/chat
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "5082:5082"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 5082
+      MONGO_URI: mongodb://mongo:27017
+      USER_SERVICE_URL: http://user:5000
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      user:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_USER_SERVICE_URL: ${NEXT_PUBLIC_USER_SERVICE_URL:-http://localhost:5000}
+        NEXT_PUBLIC_CHAT_SERVICE_URL: ${NEXT_PUBLIC_CHAT_SERVICE_URL:-http://localhost:5082}
+        NEXT_PUBLIC_SHARED_SECRET: ${NEXT_PUBLIC_SHARED_SECRET:-dev-shared-secret}
+        NEXT_PUBLIC_VAPID_PUBLIC_KEY: ${NEXT_PUBLIC_VAPID_PUBLIC_KEY:-}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      user:
+        condition: service_healthy
+      chat:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
+  redis_data:
+  rabbitmq_data:

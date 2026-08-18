@@ -1,7 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  output: "standalone",
+  turbopack: {},
+  allowedDevOrigins: ["10.231.1.208"],
 };
 
 export default nextConfig;

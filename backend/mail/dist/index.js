@@ -9,7 +9,11 @@ const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
 (0, consumer_js_1.startSendOtpConsumer)();
 const app = (0, express_1.default)();
-app.listen(process.env.PORT, () => {
-    console.log(`Server is running on port ${process.env.PORT}`);
+app.get("/health", (_req, res) => {
+    res.json({ status: "ok", service: "mail" });
+});
+const port = Number(process.env.PORT) || 5001;
+app.listen(port, "0.0.0.0", () => {
+    console.log(`Mail service running on port ${port}`);
 });
 //# sourceMappingURL=index.js.map

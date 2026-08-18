@@ -1,0 +1,74 @@
+# Production: pull pre-built images from GHCR (no local Mongo/Redis/RabbitMQ)
+# Usage:
+#   export GHCR_IMAGE_PREFIX=ghcr.io/YOUR_GITHUB_USER
+#   export IMAGE_TAG=latest
+#   docker compose -f docker-compose.prod.yml --env-file .env up -d
+
+name: pulse-prod
+
+services:
+  user:
+    image: ${GHCR_IMAGE_PREFIX}/pulse-user:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${USER_PORT:-5000}:5000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  mail:
+    image: ${GHCR_IMAGE_PREFIX}/pulse-mail:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 5001
+
+  chat:
+    image: ${GHCR_IMAGE_PREFIX}/pulse-chat:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${CHAT_PORT:-5082}:5082"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 5082
+      USER_SERVICE_URL: http://user:5000
+    depends_on:
+      user:
+        condition: service_healthy
+
+  frontend:
+    image: ${GHCR_IMAGE_PREFIX}/pulse-frontend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      user:
+        condition: service_healthy
+      chat:
+        condition: service_healthy
+
+  # Optional reverse proxy (enable with: docker compose --profile proxy -f docker-compose.prod.yml up -d)
+  nginx:
+    profiles: ["proxy"]
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - user
+      - chat

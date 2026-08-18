@@ -8,6 +8,23 @@ const schema = new Schema({
         type: String,
         required: true,
         unique: true
+    },
+    profilePic: {
+        url: String,
+        publicId: String
+    },
+    pushSubscriptions: {
+        type: [
+            {
+                endpoint: { type: String, required: true },
+                keys: {
+                    p256dh: { type: String },
+                    auth: { type: String },
+                },
+                expirationTime: { type: Date, default: null },
+            }
+        ],
+        default: [],
     }
 }, {
     timestamps: true,

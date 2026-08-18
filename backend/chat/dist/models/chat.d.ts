@@ -1,10 +1,13 @@
 import mongoose, { Document, Types } from "mongoose";
 export interface IChat extends Document {
+    chatName?: string;
+    isGroupChat: boolean;
     users: string[];
     latestMessage: {
         text: string;
         sender: string;
     };
+    groupAdmin?: string;
     createdAt: Date;
     updatedAt: Date;
 }

@@ -3,6 +3,8 @@ import TryCatch from '../config/TryCatch.js';
 import { redisClient } from '../index.js';
 import { User } from '../model/User.js';
 import { generateToken } from '../config/generateToken.js';
+import cloudinary from '../config/cloudinary.js';
+import { getCache, setCache, delCache } from '../config/cache.js';
 export const loginUser = TryCatch(async (req, res) => {
     const { email } = req.body;
     const rateLimitKey = `otp:ratelimit:${email}`;
@@ -27,7 +29,7 @@ export const loginUser = TryCatch(async (req, res) => {
         subject: "your OTP code",
         body: `Your OTP code is ${otp}. It is valid 5 minutes.`
     };
-    await publishToQueue("send-otp", message);
+    await publishToQueue("send-otp", message); //if the sent-otp queue is not present then it creates it automatically
     res.status(200).json({
         message: "OTP is sent to your mail"
     });
@@ -53,16 +55,43 @@ export const verifyUser = TryCatch(async (require, res) => {
     if (!user) {
         const name = email.slice(0, 8);
         user = await User.create({ name, email });
+        // New user created — invalidate user list cache
+        await delCache('users:list').catch(() => { });
     }
     const token = generateToken(user);
-    res.json({
+    res.cookie("token", token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "strict",
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    }).json({
         message: "User verified successfully",
         user,
         token,
     });
 });
+export const logoutUser = TryCatch(async (req, res) => {
+    res.cookie("token", "", {
+        httpOnly: true,
+        expires: new Date(0),
+    }).json({
+        message: "Logged out successfully"
+    });
+});
 export const myProfile = TryCatch(async (req, res) => {
-    const user = req.user;
+    const userId = req.user?._id?.toString();
+    const cacheKey = `user:${userId}`;
+    const cached = await getCache(cacheKey);
+    if (cached) {
+        res.json(cached);
+        return;
+    }
+    const user = await User.findById(userId).select("-pushSubscriptions");
+    if (!user) {
+        res.status(404).json({ message: "User not found" });
+        return;
+    }
+    await setCache(cacheKey, user, 120);
     res.json(user);
 });
 export const updateName = TryCatch(async (req, res) => {
@@ -76,18 +105,142 @@ export const updateName = TryCatch(async (req, res) => {
     user.name = req.body.name;
     await user.save();
     const token = generateToken(user);
-    res.json({
+    // Invalidate caches for this user
+    await delCache(`user:${user._id}`).catch(() => { });
+    await delCache('users:list').catch(() => { });
+    res.cookie("token", token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "strict",
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+    }).json({
         message: "Name updated Successfully",
         user,
         token
     });
 });
 export const getAllUsers = TryCatch(async (req, res) => {
-    const users = await User.find();
+    const cacheKey = 'users:list';
+    const cached = await getCache(cacheKey);
+    if (cached) {
+        console.log('Returning cached users list');
+        res.json(cached);
+        return;
+    }
+    const users = await User.find().select("-pushSubscriptions");
+    // Only cache if we have users
+    if (users.length > 0) {
+        await setCache(cacheKey, users, 60);
+    }
     res.json(users);
 });
 export const getAUser = TryCatch(async (req, res) => {
-    const user = await User.findById(req.params.id);
+    const userId = req.params.id;
+    const cacheKey = `user:${userId}`;
+    // Try to get from cache first
+    const cached = await getCache(cacheKey);
+    if (cached) {
+        res.json(cached);
+        return;
+    }
+    // Fetch from DB
+    const user = await User.findById(userId).select("-pushSubscriptions");
+    if (!user) {
+        res.status(404).json({ message: "User not found" });
+        return;
+    }
+    // Cache valid user data for 2 minutes
+    await setCache(cacheKey, user, 120);
     res.json(user);
+});
+export const updateProfilePic = TryCatch(async (req, res) => {
+    const user = await User.findById(req.user?._id);
+    if (!user) {
+        res.status(404).json({
+            message: "User not found"
+        });
+        return;
+    }
+    const file = req.file;
+    if (!file) {
+        res.status(400).json({
+            message: "No file uploaded"
+        });
+        return;
+    }
+    // If user already has a profile pic, delete the old one from Cloudinary
+    if (user.profilePic && user.profilePic.publicId) {
+        await cloudinary.uploader.destroy(user.profilePic.publicId);
+    }
+    user.profilePic = {
+        url: file.path,
+        publicId: file.filename,
+    };
+    await user.save();
+    const token = generateToken(user);
+    // Invalidate caches for this user
+    await delCache(`user:${user._id}`).catch(() => { });
+    await delCache('users:list').catch(() => { });
+    res.cookie("token", token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "strict",
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+    }).json({
+        message: "Profile picture updated successfully",
+        user,
+        token,
+    });
+});
+export const savePushSubscription = TryCatch(async (req, res) => {
+    const userId = req.user?._id;
+    if (!userId) {
+        res.status(401).json({ message: "Unauthorized" });
+        return;
+    }
+    const { subscription } = req.body;
+    if (!subscription?.endpoint) {
+        res.status(400).json({ message: "Invalid subscription" });
+        return;
+    }
+    const user = await User.findById(userId);
+    if (!user) {
+        res.status(404).json({ message: "User not found" });
+        return;
+    }
+    user.pushSubscriptions = user.pushSubscriptions || [];
+    const endpoint = subscription.endpoint;
+    const updatedKeys = subscription.keys || {};
+    const expirationTime = subscription.expirationTime || null;
+    const normalized = {
+        endpoint,
+        keys: {
+            p256dh: updatedKeys.p256dh,
+            auth: updatedKeys.auth,
+        },
+        expirationTime,
+    };
+    const existingIndex = user.pushSubscriptions.findIndex((s) => s.endpoint === endpoint);
+    if (existingIndex >= 0) {
+        user.pushSubscriptions[existingIndex] = normalized;
+    }
+    else {
+        user.pushSubscriptions.push(normalized);
+    }
+    await user.save();
+    res.json({ success: true });
+});
+export const getPushSubscriptionByUserId = TryCatch(async (req, res) => {
+    const { userId } = req.params;
+    if (!userId) {
+        res.status(400).json({ message: "userId is required" });
+        return;
+    }
+    const user = await User.findById(userId);
+    if (!user) {
+        res.status(404).json({ message: "User not found" });
+        return;
+    }
+    res.json({ subscription: user.pushSubscriptions?.[0] || null });
 });
 //# sourceMappingURL=user.js.map

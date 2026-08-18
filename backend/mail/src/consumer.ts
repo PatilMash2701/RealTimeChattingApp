@@ -1,13 +1,24 @@
 import amqp from 'amqplib';
-import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
-import path from 'path';
 
 
-dotenv.config({ path: path.resolve(process.cwd(), '../mail/.env') });
+// Differences vs other connection types:
 
-console.log('USER:', process.env.USER);
-console.log('PASSWORD:', process.env.PASSWORD ? 'loaded' : 'undefined');
+// HTTP (plain) is transient per request.
+// WebSocket / socket.io are persistent client connections (also keep process active).
+// AMQP (RabbitMQ) uses a persistent TCP connection that the consumer keeps open.
+
+
+// Short answer: not automatically — it stays "open" only while the process running startSendOtpConsumer() is alive and connected.
+
+// Details:
+
+// What the code does: startSendOtpConsumer() connects to RabbitMQ, creates a channel, asserts the send-otp queue, then calls channel.consume() to listen indefinitely for messages. While that Node process and AMQP connection are up, the consumer runs continuously.
+
+// When it can stop:
+// If the Node process is killed/crashes, the consumer stops.
+// If the initial connection fails, the function logs and exits (no retry).
+// If the connection drops later, there's no reconnection logic in the current code, so the consumer will stop receiving.
 
 export const startSendOtpConsumer = async() => {
      try{
@@ -32,12 +43,22 @@ export const startSendOtpConsumer = async() => {
             try{
                 const {to, subject, body} = JSON.parse(msg.content.toString());
 
+                const smtpUser = process.env.SMTP_USER || process.env.MAIL_USER;
+                const smtpPass = process.env.SMTP_PASSWORD || process.env.MAIL_PASSWORD;
+
+                if (!smtpUser || !smtpPass) {
+                    console.error("SMTP credentials missing (set SMTP_USER and SMTP_PASSWORD)");
+                    channel.nack(msg, false, false);
+                    return;
+                }
+
                 const transporter = nodemailer.createTransport({
-                    host:"smtp.gmail.com",
-                    port:465,
-                    auth:{
-                        user : process.env.USER,
-                        pass : process.env.PASSWORD
+                    host: process.env.SMTP_HOST || "smtp.gmail.com",
+                    port: Number(process.env.SMTP_PORT) || 465,
+                    secure: process.env.SMTP_SECURE !== "false",
+                    auth: {
+                        user: smtpUser,
+                        pass: smtpPass,
                     },
                 });
 

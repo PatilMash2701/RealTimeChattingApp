@@ -2,6 +2,8 @@ import TryCatch from "../config/TryCatch.js";
 import { Chat } from "../models/chat.js";
 import { Messages } from "../models/messages.js";
 import axios from "axios";
+import { getReceiverSocketId, io } from "../config/socket.js";
+import webpush from "../config/webpush.js";
 import { Types } from "mongoose";
 export const createNewChat = TryCatch(async (req, res) => {
     const userId = req.user?._id;
@@ -39,19 +41,45 @@ export const getAllChats = TryCatch(async (req, res) => {
         });
         return;
     }
-    //returns chat where userId is present on any poisition userId or otherUserId ;
-    //Convert userId to string for comparison with stored string IDs
+    const { page = 1, limit = 20 } = req.query;
+    const skip = (Number(page) - 1) * Number(limit);
     const userIdString = userId.toString();
-    const chats = await Chat.find({ users: userIdString }).sort({ updatedAt: -1 });
+    const chats = await Chat.find({ users: userIdString })
+        .sort({ updatedAt: -1 })
+        .skip(skip)
+        .limit(Number(limit));
     const chatWithUserData = await Promise.all(chats.map(async (chat) => {
-        const otherUserId = chat.users.find(id => id !== userIdString);
         const unseenCount = await Messages.countDocuments({
             chatId: chat._id,
-            sender: { $ne: userId?.toString() }, //we want to count only where I am not sender,becuase we get notification when only we got the message from other
+            sender: { $ne: userId?.toString() },
             seen: false
         });
+        if (chat.isGroupChat) {
+            return {
+                user: { _id: chat._id, name: chat.chatName, isGroup: true },
+                chat: {
+                    ...chat.toObject(),
+                    latestMessage: chat.latestMessage || null,
+                    unseenCount,
+                }
+            };
+        }
+        const otherUserId = chat.users.find(id => id !== userIdString);
         try {
-            const { data } = await axios.get(`${process.env.USER_SERVICE_URL}/api/v1/user/${otherUserId}`);
+            const { data } = await axios.get(`${process.env.USER_SERVICE_URL}/api/v1/user/${otherUserId}`, {
+                timeout: 5000 // 5 second timeout
+            });
+            if (!data) {
+                console.warn(`User service returned empty data for user ${otherUserId}`);
+                return {
+                    user: { _id: otherUserId, name: "Unknown User" },
+                    chat: {
+                        ...chat.toObject(),
+                        latestMessage: chat.latestMessage || null,
+                        unseenCount,
+                    }
+                };
+            }
             return {
                 user: data,
                 chat: {
@@ -62,7 +90,8 @@ export const getAllChats = TryCatch(async (req, res) => {
             };
         }
         catch (error) {
-            console.log(error);
+            const errMsg = error instanceof Error ? error.message : String(error);
+            console.error(`Failed to fetch user ${otherUserId} from user service:`, errMsg);
             return {
                 user: { _id: otherUserId, name: "Unknown User" },
                 chat: {
@@ -73,14 +102,12 @@ export const getAllChats = TryCatch(async (req, res) => {
             };
         }
     }));
-    res.json({
-        chats: chatWithUserData
-    });
+    res.json(chatWithUserData);
 });
 export const sendMessage = TryCatch(async (req, res) => {
     const senderId = req.user?._id;
-    const { chatId, text } = req.body;
-    const imageFile = req.file;
+    const { chatId, text, replyTo, searchText } = req.body;
+    const uploadedFile = req.file;
     if (!senderId) {
         res.status(401).json({
             message: "unauthorized",
@@ -93,7 +120,7 @@ export const sendMessage = TryCatch(async (req, res) => {
         });
         return;
     }
-    if (!text && !imageFile) {
+    if (!text && !uploadedFile) {
         res.status(400).json({
             message: "Either text or image is required",
         });
@@ -114,25 +141,50 @@ export const sendMessage = TryCatch(async (req, res) => {
         return;
     }
     const otherUserId = chat.users.find((userId) => userId.toString() !== senderId.toString());
-    if (!otherUserId) {
-        res.status(401).json({
-            message: "No other user",
-        });
-        return;
-    }
-    //socket setup
     let messageData = {
         chatId: new Types.ObjectId(chatId),
         sender: senderId?.toString(),
         seen: false,
         seenAt: undefined,
+        delivered: false,
+        deliveredAt: null,
+        isDeleted: false,
+        searchText: searchText ?? text,
     };
-    if (imageFile) {
-        messageData.image = {
-            url: imageFile.path,
-            publicId: imageFile.filename,
+    let parsedReplyTo = replyTo;
+    if (typeof replyTo === "string") {
+        try {
+            parsedReplyTo = JSON.parse(replyTo);
+        }
+        catch {
+            parsedReplyTo = null;
+        }
+    }
+    if (parsedReplyTo && parsedReplyTo.messageId && parsedReplyTo.text && parsedReplyTo.sender) {
+        messageData.replyTo = {
+            messageId: parsedReplyTo.messageId,
+            text: parsedReplyTo.text,
+            sender: parsedReplyTo.sender,
         };
-        messageData.messageType = "image";
+    }
+    if (uploadedFile) {
+        const isImage = uploadedFile.mimetype?.startsWith("image/");
+        if (isImage) {
+            messageData.image = {
+                url: uploadedFile.path,
+                publicId: uploadedFile.filename,
+            };
+            messageData.messageType = "image";
+        }
+        else {
+            messageData.file = {
+                url: uploadedFile.path,
+                publicId: uploadedFile.filename,
+                name: uploadedFile.originalname || uploadedFile.filename,
+                size: uploadedFile.size || 0,
+            };
+            messageData.messageType = "file";
+        }
         messageData.text = text || "";
     }
     else {
@@ -141,7 +193,49 @@ export const sendMessage = TryCatch(async (req, res) => {
     }
     const message = new Messages(messageData);
     const savedMessage = await message.save();
-    const latestMessageText = imageFile ? "📷 Image" : text;
+    // If the receiver is already online, mark delivered immediately.
+    if (chat && !chat.isGroupChat && otherUserId) {
+        const receiverSocketId = getReceiverSocketId(otherUserId.toString());
+        if (receiverSocketId) {
+            const deliveredAt = new Date();
+            await Messages.updateOne({ _id: savedMessage._id }, { delivered: true, deliveredAt });
+            const senderSocketId = getReceiverSocketId(senderId?.toString() || "");
+            if (senderSocketId) {
+                io.to(senderSocketId).emit("messagesDelivered", {
+                    messageIds: [savedMessage._id.toString()],
+                });
+            }
+        }
+    }
+    // Web Push fallback when receiver is offline.
+    // Note: since text may be AES-encrypted on the client, we avoid trying to show plaintext here.
+    if (chat && !chat.isGroupChat && otherUserId) {
+        const receiverSocketId = getReceiverSocketId(otherUserId.toString());
+        const hasVapid = Boolean(process.env.VAPID_PUBLIC_KEY) && Boolean(process.env.VAPID_PRIVATE_KEY) && Boolean(process.env.USER_SERVICE_URL);
+        if (!receiverSocketId && hasVapid) {
+            try {
+                const subscriptionRes = await axios.get(`${process.env.USER_SERVICE_URL}/api/v1/user/push-subscription/${otherUserId}`);
+                const subscription = subscriptionRes.data?.subscription;
+                if (subscription) {
+                    const senderName = req.user?.name || "New message";
+                    const body = savedMessage.messageType === "image"
+                        ? "Sent an image"
+                        : savedMessage.messageType === "file"
+                            ? "Sent a file"
+                            : "New message";
+                    await webpush.sendNotification(subscription, JSON.stringify({
+                        title: senderName,
+                        body,
+                    }));
+                }
+            }
+            catch (err) {
+                console.log("Web push failed:", err);
+            }
+        }
+    }
+    const isImage = uploadedFile?.mimetype?.startsWith("image/");
+    const latestMessageText = uploadedFile ? (isImage ? "📷 Image" : "📎 File") : text;
     await Chat.findByIdAndUpdate(new Types.ObjectId(chatId), {
         latestMessage: {
             text: latestMessageText,
@@ -149,77 +243,272 @@ export const sendMessage = TryCatch(async (req, res) => {
         },
         updatedAt: new Date(),
     }, { new: true });
-    //emit to sockets
+    // 1. Emit to the room (all members in that room get this for live chat UI)
+    io.to(chatId.toString()).emit("newMessage", savedMessage);
+    // 2. Also emit to individual sockets for sidebar updates (unread counts/previews),
+    // but SKIP users who are already in the room (to avoid double-notifying)
+    // Actually, Socket.io takes care of most of this, but it's cleaner to handle per-user
+    chat.users.forEach((userId) => {
+        if (userId.toString() !== senderId.toString()) {
+            const receiverSocketId = getReceiverSocketId(userId.toString());
+            // Since we can't easily check if a socket is in a room without async overhead,
+            // we'll rely on the frontend's duplicate-check (which is already implemented).
+            // However, we avoid sending a separate individual 'newMessage' to the SENDER.
+            if (receiverSocketId) {
+                io.to(receiverSocketId).emit("newMessage", savedMessage);
+            }
+        }
+    });
     res.status(201).json({
         message: savedMessage,
         sender: senderId
     });
 });
-export const getMessagesByChat = TryCatch(async (req, res) => {
-    const userId = req.user?._id;
-    const chatIdParam = req.params.chatId;
+export const reactToMessage = TryCatch(async (req, res) => {
+    const { messageId, emoji } = req.body;
+    const userId = req.user?._id?.toString();
     if (!userId) {
-        res.status(400).json({
-            message: "userId required"
-        });
+        res.status(401).json({ message: "Unauthorized" });
         return;
     }
-    if (!chatIdParam || Array.isArray(chatIdParam)) {
-        res.status(400).json({
-            message: "chatId required"
-        });
+    if (!messageId || !emoji) {
+        res.status(400).json({ message: "messageId and emoji are required" });
         return;
     }
-    const chatObjectId = new Types.ObjectId(chatIdParam);
+    const message = await Messages.findById(messageId);
+    if (!message) {
+        res.status(404).json({ message: "Message not found" });
+        return;
+    }
+    const reactions = message.reactions || [];
+    const existing = reactions.find((r) => r.userId === userId && r.emoji === emoji);
+    if (existing) {
+        await Messages.updateOne({ _id: messageId }, { $pull: { reactions: { userId, emoji } } });
+    }
+    else {
+        await Messages.updateOne({ _id: messageId }, { $push: { reactions: { userId, emoji } } });
+    }
+    const updated = await Messages.findById(messageId).select("chatId reactions");
+    if (!updated || !updated.chatId) {
+        res.status(404).json({ message: "Message not found" });
+        return;
+    }
+    io.to(updated.chatId.toString()).emit("messageReaction", {
+        messageId,
+        reactions: updated.reactions || [],
+    });
+    res.json({ success: true });
+});
+export const deleteMessage = TryCatch(async (req, res) => {
+    const { messageId } = req.params;
+    const userId = req.user?._id?.toString();
+    if (!userId) {
+        res.status(401).json({ message: "Unauthorized" });
+        return;
+    }
+    if (!messageId) {
+        res.status(400).json({ message: "messageId is required" });
+        return;
+    }
+    const message = await Messages.findById(messageId);
+    if (!message) {
+        res.status(404).json({ message: "Message not found" });
+        return;
+    }
+    if (message.sender !== userId) {
+        res.status(403).json({ message: "Can only delete your own messages" });
+        return;
+    }
+    // Soft delete: keep record but replace content to avoid broken reply references.
+    message.text = "This message was deleted";
+    message.image = undefined;
+    message.file = undefined;
+    message.isDeleted = true;
+    await message.save();
+    io.to(message.chatId.toString()).emit("messageDeleted", { messageId });
+    res.json({ success: true });
+});
+export const searchMessages = TryCatch(async (req, res) => {
+    const { chatId, query } = req.query;
+    if (!chatId || !query) {
+        res.status(400).json({ message: "chatId and query are required" });
+        return;
+    }
+    const messages = await Messages.find({ chatId: new Types.ObjectId(chatId), $text: { $search: query } }, { score: { $meta: "textScore" } })
+        .sort({ score: { $meta: "textScore" } })
+        .limit(20);
+    res.json({ messages });
+});
+export const getMessagesByChat = TryCatch(async (req, res, next) => {
+    const userId = req.user?._id;
+    if (!userId) {
+        res.status(400).json({ message: "userId required" });
+        return;
+    }
+    const { page = 1, limit = 50 } = req.query;
+    let chatId;
+    const rawChatId = req.params.chatId || req.params.groupId;
+    if (!rawChatId || Array.isArray(rawChatId)) {
+        res.status(400).json({ message: "Valid chatId or groupId required" });
+        return;
+    }
+    chatId = rawChatId;
+    const skip = (Number(page) - 1) * Number(limit);
+    const chatObjectId = new Types.ObjectId(chatId);
     const chat = await Chat.findById(chatObjectId);
     if (!chat) {
-        res.status(404).json({
-            message: "chat not found"
-        });
+        res.status(404).json({ message: "chat not found" });
         return;
     }
     const isUserInChat = chat.users.some((id) => id.toString() === userId?.toString());
     if (!isUserInChat) {
-        res.status(403).json({
-            message: "You are not a participant of this chat",
-        });
+        res.status(403).json({ message: "You are not a participant of this chat" });
         return;
     }
-    const messagesToMarkSeen = await Messages.find({
-        chatId: chatObjectId,
-        sender: { $ne: userId?.toString() }, //means messages are coming from other
-        seen: false,
-    });
     await Messages.updateMany({
         chatId: chatObjectId,
-        sender: { $ne: userId?.toString() }, //means messages are coming from other
+        sender: { $ne: userId?.toString() },
         seen: false,
     }, {
         seen: true,
         seenAt: new Date(),
     });
-    const messages = await Messages.find({ chatId: chatObjectId }).sort({ createdAt: 1 });
+    const messages = await Messages.find({ chatId: chatObjectId })
+        .sort({ createdAt: -1 }) // Sort descending for pagination
+        .skip(skip)
+        .limit(Number(limit));
+    // Re-sort ascending for the UI
+    const sortedMessages = messages.reverse();
     const otherUserId = chat.users.find((id) => id.toString() !== userId?.toString());
     try {
-        const { data } = await axios.get(`${process.env.USER_SERVICE_URL}/api/v1/user/${otherUserId}`);
-        if (!data) {
-            res.status(400).json({
-                message: "No other user",
-            });
-            return;
+        let displayUser = null;
+        if (chat.isGroupChat) {
+            displayUser = { _id: chat._id, name: chat.chatName, isGroup: true };
         }
-        //socket work
+        else {
+            try {
+                const { data } = await axios.get(`${process.env.USER_SERVICE_URL}/api/v1/user/${otherUserId}`, {
+                    timeout: 5000
+                });
+                if (!data) {
+                    console.warn(`User service returned empty data for user ${otherUserId}`);
+                    displayUser = { _id: otherUserId, name: "Unknown User" };
+                }
+                else {
+                    displayUser = data;
+                }
+            }
+            catch (err) {
+                const errMsg = err instanceof Error ? err.message : String(err);
+                console.error(`Failed to fetch user ${otherUserId}:`, errMsg);
+                displayUser = { _id: otherUserId, name: "Unknown User" };
+            }
+        }
         res.json({
-            messages,
-            user: data,
+            messages: sortedMessages,
+            user: displayUser,
+            chat: chat
         });
     }
     catch (error) {
-        console.log(error);
+        const errMsg = error instanceof Error ? error.message : String(error);
+        console.error('Error in getMessages:', errMsg);
         res.json({
-            messages,
-            user: { _id: otherUserId, name: "Unknown user" }
+            messages: sortedMessages,
+            user: { _id: otherUserId, name: "Unknown user" },
+            chat: chat
         });
     }
+});
+export const getMessagesBetweenUsers = TryCatch(async (req, res, next) => {
+    const { userId, receiverId } = req.params;
+    const loggedInUser = req.user?._id.toString();
+    if (loggedInUser !== userId) {
+        res.status(403).json({ message: "Unauthorized" });
+        return;
+    }
+    const chat = await Chat.findOne({
+        isGroupChat: false,
+        users: { $all: [userId, receiverId] }
+    });
+    if (!chat) {
+        res.status(404).json({ message: "Chat not found" });
+        return;
+    }
+    // Reuse getMessagesByChat internal logic or just redirect
+    req.params.chatId = chat._id.toString();
+    return getMessagesByChat(req, res, next);
+});
+export const createGroupChat = TryCatch(async (req, res) => {
+    const { users, name } = req.body;
+    if (!users || !name) {
+        res.status(400).json({ message: "Please fill all the fields" });
+        return;
+    }
+    if (users.length < 2) {
+        res.status(400).json({ message: "More than 2 users are required to form a group chat" });
+        return;
+    }
+    const adminId = req.user?._id?.toString();
+    if (!adminId) {
+        res.status(401).json({ message: "Unauthorized" });
+        return;
+    }
+    // Add current user to group
+    const participants = [...users, adminId];
+    const groupChat = await Chat.create({
+        chatName: name,
+        users: participants,
+        isGroupChat: true,
+        groupAdmin: adminId,
+    });
+    res.status(200).json(groupChat);
+});
+export const renameGroup = TryCatch(async (req, res) => {
+    const { chatId, name } = req.body;
+    const userId = req.user?._id.toString();
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+        res.status(404).json({ message: "Chat not found" });
+        return;
+    }
+    if (chat.groupAdmin !== userId) {
+        res.status(403).json({ message: "Only admin can rename the group" });
+        return;
+    }
+    const updatedChat = await Chat.findByIdAndUpdate(chatId, { chatName: name }, { new: true });
+    res.status(200).json(updatedChat);
+});
+export const addToGroup = TryCatch(async (req, res) => {
+    const { userIdToAdd } = req.body;
+    const { groupId } = req.params;
+    const adminId = req.user?._id.toString();
+    const chat = await Chat.findById(groupId);
+    if (!chat) {
+        res.status(404).json({ message: "Chat not found" });
+        return;
+    }
+    if (chat.groupAdmin !== adminId) {
+        res.status(403).json({ message: "Only admin can add members" });
+        return;
+    }
+    const updatedChat = await Chat.findByIdAndUpdate(groupId, { $addToSet: { users: userIdToAdd } }, { new: true });
+    res.status(200).json(updatedChat);
+});
+export const removeFromGroup = TryCatch(async (req, res) => {
+    const { userIdToRemove } = req.body;
+    const { groupId } = req.params;
+    const adminId = req.user?._id.toString();
+    const chat = await Chat.findById(groupId);
+    if (!chat) {
+        res.status(404).json({ message: "Chat not found" });
+        return;
+    }
+    if (chat.groupAdmin !== adminId) {
+        res.status(403).json({ message: "Only admin can remove members" });
+        return;
+    }
+    const updatedChat = await Chat.findByIdAndUpdate(groupId, { $pull: { users: userIdToRemove } }, { new: true });
+    res.status(200).json(updatedChat);
 });
 //# sourceMappingURL=chat.js.map

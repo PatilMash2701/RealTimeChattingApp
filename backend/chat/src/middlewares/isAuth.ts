@@ -14,19 +14,11 @@ export interface AuthenticatedRequest extends Request {
 
 export const isAuth = async(req: AuthenticatedRequest, res: Response, next:NextFunction): Promise<void> => {
     try{
-        const authHeader = req.headers.authorization;
+        const token = req.cookies.token;
 
-        if(!authHeader || !authHeader.startsWith("Bearer")){
-            res.status(401).json({
-                message: "Please Login- No Auth Header"
-            })
-            return;
-        }
-        const token = authHeader.split(" ")[1];
-        
         if(!token){
             res.status(401).json({
-                message: "Invalid Token Format"
+                message: "Please Login- No Token found in cookies"
             })
             return;
         }
