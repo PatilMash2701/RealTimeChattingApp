@@ -48,20 +48,20 @@ However, modern **Next.js (App Router)** introduces Server Components, streaming
 ```mermaid
 flowchart TD
     subgraph Redux_Architecture["Redux Architecture (Monolithic Central Store)"]
-        UI_R[React Component] -->|dispatch action| Dispatcher[Action Dispatcher / Thunk]
-        Dispatcher -->|calls API / WebSockets| Middleware[Middleware / Side Effects]
-        Middleware -->|updates| Reducers[Pure Reducers]
-        Reducers -->|mutates immutably| RootStore[(Single Monolithic Store)]
+        UI_R["React Component"] -->|dispatch action| Dispatcher["Action Dispatcher / Thunk"]
+        Dispatcher -->|calls API / WebSockets| Middleware["Middleware / Side Effects"]
+        Middleware -->|updates| Reducers["Pure Reducers"]
+        Reducers -->|mutates immutably| RootStore[("Single Monolithic Store")]
         RootStore -->|useSelector| UI_R
     end
 
     subgraph Context_Architecture["Next.js Modular Context Architecture (Pulse Project)"]
-        ServerLayout[app/layout.tsx (Server Component)] --> AppP[AppProvider (Auth, User, Chats)]
-        AppP --> SocketP[SocketProvider (WebSocket & Online Presence)]
-        SocketP --> CallP[CallProvider (WebRTC P2P Call State)]
-        CallP --> IdP[IdentityVerificationProvider (Face AI Snapshots)]
-        IdP --> ClientUI[Client Components: Sidebar, ChatMessages, CallOverlay, Modals]
-        ClientUI -->|useAppData / SocketData / useCall| DomainContexts[Domain Context Hooks]
+        ServerLayout["app/layout.tsx (Server Component)"] --> AppP["AppProvider (Auth, User, Chats)"]
+        AppP --> SocketP["SocketProvider (WebSocket & Online Presence)"]
+        SocketP --> CallP["CallProvider (WebRTC P2P Call State)"]
+        CallP --> IdP["IdentityVerificationProvider (Face AI Snapshots)"]
+        IdP --> ClientUI["Client Components: Sidebar, ChatMessages, CallOverlay, Modals"]
+        ClientUI -->|useAppData / SocketData / useCall| DomainContexts["Domain Context Hooks"]
     end
 ```
 
@@ -86,16 +86,16 @@ In Pulse, our real-time WhatsApp-style chat application, state is divided into *
 
 ```mermaid
 graph TD
-    A[RootLayout: app/layout.tsx] -->|Wraps with| B[AppProvider: context/AppContext.tsx]
-    B -->|Provides: user, isAuth, chats, users, fetchUser, logoutUser| C[SocketProvider: context/SocketContext.tsx]
-    C -->|Provides: socket instance, onlineUsers array| D[CallProvider: context/CallContext.tsx]
-    D -->|Provides: callStatus, localStream, remoteStream, startCall, endCall| E[IdentityVerificationProvider: context/IdentityVerificationContext.tsx]
-    E -->|Provides: requestPeerVerification, pendingRequest, getSnapshotForChat| F[Page & Components]
+    A["RootLayout: app/layout.tsx"] -->|Wraps with| B["AppProvider: context/AppContext.tsx"]
+    B -->|Provides: user, isAuth, chats, users, fetchUser, logoutUser| C["SocketProvider: context/SocketContext.tsx"]
+    C -->|Provides: socket instance, onlineUsers array| D["CallProvider: context/CallContext.tsx"]
+    D -->|Provides: callStatus, localStream, remoteStream, startCall, endCall| E["IdentityVerificationProvider: context/IdentityVerificationContext.tsx"]
+    E -->|Provides: requestPeerVerification, pendingRequest, getSnapshotForChat| F["Page & Components"]
 
-    F --> G[chatSidebar.tsx]
-    F --> H[chatMessages.tsx]
-    F --> I[CallOverlay.tsx]
-    F --> J[IdentityVerificationResponderModal.tsx]
+    F --> G["chatSidebar.tsx"]
+    F --> H["chatMessages.tsx"]
+    F --> I["CallOverlay.tsx"]
+    F --> J["IdentityVerificationResponderModal.tsx"]
 ```
 
 ### Context Domains Breakdown
